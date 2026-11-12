@@ -43,7 +43,7 @@ class CacheRegistry:
             return
 
         elif isinstance(cache, bool):
-            if cache is False:
+            if not cache:
                 return
             else:
                 cache = cls.level_option
@@ -58,137 +58,123 @@ class CacheRegistry:
 
 
 class DirRule:
-    rule_sample = [
-        # 根目录 / Album-id / Photo-序号 /
-        'Bd_Aid_Pindex',  # 禁漫网站的默认下载方式
-        # 根目录 / Album-作者 / Album-标题 / Photo-序号 /
-        'Bd_Aauthor_Atitle_Pindex',
-        # 根目录 / Photo-序号&标题 /
-        'Bd_Pindextitle',
-        # 根目录 / Photo-自定义类属性 /
-        'Bd_Aauthor_Atitle_Pcustomfield',
-        # 需要替换JmModuleConfig.CLASS_ALBUM / CLASS_PHOTO才能让自定义属性生效
-    ]
+    RULE_BASE_DIR = 'Bd'
 
-    Detail = Union[JmAlbumDetail, JmPhotoDetail, None]
-    RuleFunc = Callable[[Detail], str]
-    RuleSolver = Tuple[str, RuleFunc, str]
-    RuleSolverList = List[RuleSolver]
-
-    def __init__(self, rule: str, base_dir=None):
+    def __init__(self, rule: str, base_dir=None, normalize_zh=None):
+        """
+        :param rule: DSL rule
+        :param base_dir: base directory
+        :param normalize_zh: 'zh-cn'|'zh-tw'| or None. 控制是否以及如何进行繁简体归一化，默认 None
+        """
         base_dir = JmcomicText.parse_to_abspath(base_dir)
         self.base_dir = base_dir
         self.rule_dsl = rule
-        self.solver_list = self.get_role_solver_list(rule, base_dir)
+        self.normalize_zh = normalize_zh
+        self.parser_list: List[Tuple[str, Callable]] = self.get_rule_parser_list(rule)
 
     def decide_image_save_dir(self,
                               album: JmAlbumDetail,
                               photo: JmPhotoDetail,
                               ) -> str:
-        path_ls = []
-        for solver in self.solver_list:
-            try:
-                ret = self.apply_rule_solver(album, photo, solver)
-            except BaseException as e:
-                # noinspection PyUnboundLocalVariable
-                jm_log('dir_rule', f'路径规则"{solver[2]}"的解析出错: {e}, album={album}, photo={photo}')
-                raise e
-
-            path_ls.append(str(ret))
-
-        return fix_filepath('/'.join(path_ls), is_dir=True)
+        return self.apply_rule_to_path(album, photo)
 
     def decide_album_root_dir(self, album: JmAlbumDetail) -> str:
-        path_ls = []
-        for solver in self.solver_list:
-            key, _, rule = solver
+        return self.apply_rule_to_path(album, None, True)
 
-            if key != 'Bd' and key != 'A':
+    def apply_rule_to_path(self, album, photo, only_album_rules=False) -> str:
+        path_ls = []
+        for rule, parser in self.parser_list:
+            if only_album_rules and not (rule == self.RULE_BASE_DIR or rule.startswith('A')):
                 continue
 
             try:
-                ret = self.apply_rule_solver(album, None, solver)
+                path = parser(album, photo, rule)
             except BaseException as e:
                 # noinspection PyUnboundLocalVariable
-                jm_log('dir_rule', f'路径规则"{rule}"的解析出错: {e}, album={album}')
+                jm_log('dir_rule', f'路径规则"{rule}"的解析出错: {e}, album={album}, photo={photo}', e)
                 raise e
+            if parser != self.parse_bd_rule:
+                # 根据配置 normalize_zh 进行繁简体统一
+                conv_path = JmcomicText.to_zh(str(path), self.normalize_zh)
+                path = fix_windir_name(conv_path).strip()
 
-            path_ls.append(str(ret))
+            path_ls.append(path)
 
-        return fix_filepath('/'.join(path_ls), is_dir=True)
+        return fix_filepath('/'.join(path_ls))
 
-    def get_role_solver_list(self, rule_dsl: str, base_dir: str) -> RuleSolverList:
+    def get_rule_parser_list(self, rule_dsl: str):
         """
         解析下载路径dsl，得到一个路径规则解析列表
         """
 
         rule_list = self.split_rule_dsl(rule_dsl)
-        solver_ls: List[DirRule.RuleSolver] = []
+        parser_list: list = []
 
         for rule in rule_list:
-            rule = rule.strip()
-            if rule == 'Bd':
-                solver_ls.append(('Bd', lambda _: base_dir, 'Bd'))
+            if rule == self.RULE_BASE_DIR:
+                parser_list.append((rule, self.parse_bd_rule))
                 continue
 
-            rule_solver = self.get_rule_solver(rule)
-            if rule_solver is None:
+            parser = self.get_rule_parser(rule)
+            if parser is None:
                 ExceptionTool.raises(f'不支持的dsl: "{rule}" in "{rule_dsl}"')
 
-            solver_ls.append(rule_solver)
+            parser_list.append((rule, parser))
 
-        return solver_ls
+        return parser_list
+
+    # noinspection PyUnusedLocal
+    def parse_bd_rule(self, album, photo, rule):
+        return self.base_dir
+
+    @classmethod
+    def parse_f_string_rule(cls, album, photo, rule: str):
+        properties = {}
+        if album is not None:
+            properties.update(album.get_properties_dict())
+        if photo is not None:
+            properties.update(photo.get_properties_dict())
+        return rule.format(**properties)
+
+    @classmethod
+    def parse_detail_rule(cls, album, photo, rule: str):
+        detail = album if rule.startswith('A') else photo
+        return str(DetailEntity.get_dirname(detail, rule[1:]))
 
     # noinspection PyMethodMayBeStatic
     def split_rule_dsl(self, rule_dsl: str) -> List[str]:
-        if rule_dsl == 'Bd':
-            return [rule_dsl]
-
         if '/' in rule_dsl:
-            return rule_dsl.split('/')
+            rule_list = rule_dsl.split('/')
+        elif '_' in rule_dsl:
+            rule_list = rule_dsl.split('_')
+        else:
+            rule_list = [rule_dsl]
 
-        if '_' in rule_dsl:
-            return rule_dsl.split('_')
+        for i, e in enumerate(rule_list):
+            rule_list[i] = e.strip()
 
-        ExceptionTool.raises(f'不支持的rule配置: "{rule_dsl}"')
+        if rule_list[0] != self.RULE_BASE_DIR:
+            rule_list.insert(0, self.RULE_BASE_DIR)
 
-    @classmethod
-    def get_rule_solver(cls, rule: str) -> Optional[RuleSolver]:
-        # 检查dsl
-        if not rule.startswith(('A', 'P')):
-            return None
-
-        def solve_func(detail):
-            return fix_windir_name(str(DetailEntity.get_dirname(detail, rule[1:])))
-
-        return rule[0], solve_func, rule
+        return rule_list
 
     @classmethod
-    def apply_rule_solver(cls, album, photo, rule_solver: RuleSolver) -> str:
-        """
-        应用规则解析器(RuleSolver)
+    def get_rule_parser(cls, rule: str):
+        if '{' in rule:
+            return cls.parse_f_string_rule
 
-        :param album: JmAlbumDetail
-        :param photo: JmPhotoDetail
-        :param rule_solver: Ptitle
-        :returns: photo.title
-        """
+        if rule.startswith(('A', 'P')):
+            return cls.parse_detail_rule
 
-        def choose_detail(key):
-            if key == 'Bd':
-                return None
-            if key == 'A':
-                return album
-            if key == 'P':
-                return photo
-
-        key, func, _ = rule_solver
-        detail = choose_detail(key)
-        return func(detail)
+        return cls.parse_f_string_rule
+        # ExceptionTool.raises(f'不支持的rule配置: "{rule}"')
 
     @classmethod
-    def apply_rule_directly(cls, album, photo, rule: str) -> str:
-        return cls.apply_rule_solver(album, photo, cls.get_rule_solver(rule))
+    def apply_rule_to_filename(cls, album, photo, rule: str) -> str:
+        if album is None:
+            album = photo.from_album
+        # noinspection PyArgumentList
+        return fix_windir_name(cls.get_rule_parser(rule)(album, photo, rule)).strip()
 
 
 class JmOption:
@@ -200,7 +186,9 @@ class JmOption:
                  plugins: Dict,
                  filepath=None,
                  call_after_init_plugin=True,
+                 auth: Optional[Dict] = None,
                  ):
+        from threading import RLock
         # 路径规则配置
         self.dir_rule = DirRule(**dir_rule)
         # 客户端配置
@@ -209,26 +197,72 @@ class JmOption:
         self.download = AdvancedDict(download)
         # 插件配置
         self.plugins = AdvancedDict(plugins)
+        # 认证配置
+        # 仅在未传入时新建，传入空 dict 也直接引用，保证 copy_option 出来的副本与原 option 共享同一 auth
+        self.auth = AdvancedDict(auth if auth is not None else {})
+        self.resolve_auth_env()
+        self._auth_sync_lock = RLock()
+        self._auth_async_lock = None
+        self._auth_async_lock_loop = None
+
         # 其他配置
         self.filepath = filepath
 
         # 需要主线程等待完成的插件
         self.need_wait_plugins = []
 
+        # 依赖策略预检/处理
+        self.check_plugins_dependencies()
+
         if call_after_init_plugin:
             self.call_all_plugin('after_init', safe=True)
 
+    def resolve_auth_env(self):
+        """
+        把 auth 中形如 ${ENV_NAME} 的字符串替换为环境变量的值；环境变量未设置时置为 None，不报错。
+        支持 auth 下的字符串字段和 auth.cookies 下的字符串值。
+        """
+        data = self.auth.src_dict
+        for k, v in list(data.items()):
+            if isinstance(v, str):
+                data[k] = JmcomicText.parse_dsl_text_optional(v)
+
+        cookies = data.get('cookies')
+        if isinstance(cookies, dict):
+            for k, v in list(cookies.items()):
+                if isinstance(v, str):
+                    resolved = JmcomicText.parse_dsl_text_optional(v)
+                    if resolved is None:
+                        cookies.pop(k, None)
+                    else:
+                        cookies[k] = resolved
+            if not cookies:
+                data['cookies'] = None
+
+    def deconstruct_auth(self) -> Dict:
+        """
+        导出 auth：不包含运行时登录态（cookies、user_id）。
+        """
+        return {
+            k: v
+            for k, v in self.auth.src_dict.items()
+            if k not in ('cookies', 'user_id')
+        }
+
     def copy_option(self):
+        from copy import deepcopy
         return self.__class__(
             dir_rule={
                 'rule': self.dir_rule.rule_dsl,
                 'base_dir': self.dir_rule.base_dir,
+                'normalize_zh': self.dir_rule.normalize_zh,
             },
-            download=self.download.src_dict,
-            client=self.client.src_dict,
-            plugins=self.plugins.src_dict,
+            download=deepcopy(self.download.src_dict),
+            client=deepcopy(self.client.src_dict),
+            plugins=deepcopy(self.plugins.src_dict),
             filepath=self.filepath,
-            call_after_init_plugin=False
+            call_after_init_plugin=False,
+            auth=self.auth.src_dict,
         )
 
     """
@@ -262,7 +296,7 @@ class JmOption:
         # 非动图，以配置为先
         return self.download.image.suffix or image.img_file_suffix
 
-    def decide_image_save_dir(self, photo, ensure_exists=True) -> str:
+    def decide_image_save_dir(self, photo: JmPhotoDetail, ensure_exists=True) -> str:
         # 使用 self.dir_rule 决定 save_dir
         save_dir = self.dir_rule.decide_image_save_dir(
             photo.from_album,
@@ -288,7 +322,7 @@ class JmOption:
         if image.is_gif:
             return False
 
-        return self.download.image.decode
+        return self.download.image.decode and JmImageTool.get_num_by_detail(image) != 0
 
     """
     下面是创建对象相关方法
@@ -311,8 +345,10 @@ class JmOption:
 
         # log
         log = dic.pop('log', True)
-        if log is False:
+        if not log:
             disable_jm_log()
+        elif log == 'pretty':
+            enable_pretty_log()
 
         # version
         version = dic.pop('version', None)
@@ -341,13 +377,91 @@ class JmOption:
         if 'plugin' in dic:
             dic['plugins'] = dic.pop('plugin')
 
+        # 3: zip 插件 level 参数迁移
+        # level 已废弃，打包粒度由所在钩子上下文自动推导
+        plugins = dic.get('plugins', {})
+        if isinstance(plugins, dict):
+            cls._migrate_zip_level(plugins)
+
+    @classmethod
+    def _migrate_zip_level(cls, plugins: dict):
+        """
+        zip 插件 level 参数迁移。
+
+        level 已废弃，打包粒度由所在钩子的上下文自动推导。
+        迁移规则：level='album' → 确保在 after_album；其他 → 确保在 after_photo。
+        """
+
+        def log_advice(reason, plugins):
+            import yaml
+            # 意图聚焦：建议配置中只展示相关的 zip 插件，剔除其他无关插件的干扰
+            advice_plugins = {}
+            for g, plist in plugins.items():
+                if not isinstance(plist, list):
+                    continue
+                zips = [p for p in plist if isinstance(p, dict) and p.get('plugin') == 'zip']
+                if zips:
+                    advice_plugins[g] = zips
+
+            if not advice_plugins:
+                return
+
+            plugins_yml = yaml.dump({'plugins': advice_plugins}, default_flow_style=False, indent=2,
+                                    sort_keys=False).strip()
+
+            jm_log('option.migrate',
+                   f'[zip 插件迁移] level 参数已过时，建议直接删除。'
+                   f'{reason}，建议参考如下的等价新写法：\n'
+                   f'```yml\n'
+                   f'{plugins_yml}\n'
+                   f'```'
+                   )
+
+        for group in ['after_album', 'after_photo']:
+            plugin_list = plugins.get(group)
+            if not isinstance(plugin_list, list):
+                continue
+            i = 0
+            while i < len(plugin_list):
+                pinfo = plugin_list[i]
+                if not isinstance(pinfo, dict) or pinfo.get('plugin') != 'zip':
+                    i += 1
+                    continue
+                kwargs = pinfo.get('kwargs')
+                if not isinstance(kwargs, dict) or 'level' not in kwargs:
+                    i += 1
+                    continue
+                level = kwargs.pop('level')
+                if level is None:
+                    i += 1
+                    continue
+
+                if group == 'after_album' and level != 'album':
+                    # after_album + level=photo → 等价迁移到 after_photo
+                    plugins.setdefault('after_photo', []).append(pinfo)
+                    plugin_list.pop(i)
+                    log_advice('你的当前配置为：在本子下载完毕后按章节压缩', plugins)
+
+                elif group == 'after_photo' and level == 'album':
+                    # after_photo + level=album → 等价迁移到 after_album
+                    plugins.setdefault('after_album', []).append(pinfo)
+                    plugin_list.pop(i)
+                    log_advice('你的当前配置为：在单章节下载完毕后对全本进行压缩', plugins)
+
+                else:
+                    jm_log('option.migrate',
+                           '[zip 插件迁移] level 参数已过时，你可以直接删除该参数，不会有任何影响')
+                    i += 1
+
     def deconstruct(self) -> Dict:
         return {
             'version': JmModuleConfig.JM_OPTION_VER,
             'log': JmModuleConfig.FLAG_ENABLE_JM_LOG,
+            'auth': self.deconstruct_auth(),
             'dir_rule': {
                 'rule': self.dir_rule.rule_dsl,
                 'base_dir': self.dir_rule.base_dir,
+                'normalize_zh': self.dir_rule.normalize_zh,
             },
             'download': self.download.src_dict,
             'client': self.client.src_dict,
@@ -385,7 +499,13 @@ class JmOption:
         """
         return self.new_jm_client(**kwargs)
 
-    def new_jm_client(self, domain_list=None, impl=None, cache=None, **kwargs) -> Union[JmHtmlClient, JmApiClient]:
+    def new_jm_client(self,
+                      domain_list=None,
+                      impl=None,
+                      cache=None,
+                      domain_retry_strategy=None,
+                      **kwargs
+                      ) -> Union[JmHtmlClient, JmApiClient]:
         """
         创建新的Client（客户端），不同Client之间的元数据不共享
         """
@@ -400,7 +520,7 @@ class JmOption:
 
         cache: str = cache if cache is not None else self.client.cache  # 启用缓存
 
-        impl: str = impl or self.client.impl  # client_key
+        impl = impl or self.client.impl  # client_key
 
         if isinstance(impl, type):
             # eg: impl = JmHtmlClient
@@ -430,9 +550,14 @@ class JmOption:
 
             return domain_list
 
+        explicit_cookies = kwargs.get('cookies')
         # support kwargs overwrite meta_data
         if len(kwargs) != 0:
             meta_data.update(kwargs)
+
+        merged_cookies = self.resolve_auth_cookies(explicit_cookies)
+        if merged_cookies is not None:
+            meta_data['cookies'] = merged_cookies
 
         # postman
         postman = Postmans.create(data=postman_conf)
@@ -442,11 +567,14 @@ class JmOption:
         if clazz == AbstractJmClient or not issubclass(clazz, AbstractJmClient):
             raise NotImplementedError(clazz)
 
-        client: AbstractJmClient = clazz(
+        client: JmcomicClient = clazz(
             postman=postman,
             domain_list=decide_domain_list(),
             retry_times=retry_times,
+            domain_retry_strategy=domain_retry_strategy,
         )
+        client._username = self.auth.get('username')
+        client._user_id = self.auth.get('user_id')
 
         # enable cache
         CacheRegistry.enable_client_cache_on_condition(self, client, cache)
@@ -454,16 +582,130 @@ class JmOption:
         # noinspection PyTypeChecker
         return client
 
-    def update_cookies(self, cookies: dict):
-        metadata: dict = self.client.postman.meta_data.src_dict
-        orig_cookies: Optional[Dict] = metadata.get('cookies', None)
-        if orig_cookies is None:
-            metadata['cookies'] = cookies
-        else:
-            orig_cookies.update(cookies)
-            metadata['cookies'] = orig_cookies
+    def resolve_auth_cookies(self, extra_cookies: Optional[dict] = None) -> Optional[dict]:
+        """
+        按优先级从低到高合并 cookies：
+        1. client.postman.meta_data.cookies（旧配置兜底）
+        2. auth.cookies（顶层 auth 高优先级）
+        3. extra_cookies（单次创建客户端显式传参，最高优先级）
+        """
+        meta_cookies = self.client.postman.meta_data.get('cookies')
+        auth_cookies = self.auth.get('cookies')
+        if meta_cookies is None and auth_cookies is None and extra_cookies is None:
+            return None
 
-    # noinspection PyMethodMayBeStatic
+        merged = {}
+        for item in (meta_cookies, auth_cookies, extra_cookies):
+            raw = item.src_dict if isinstance(item, AdvancedDict) else item
+            if isinstance(raw, dict):
+                merged.update(raw)
+        return merged
+
+    def _is_auth_logged_in(self, is_api: bool) -> bool:
+        if not self.auth.get('cookies'):
+            return False
+        if is_api:
+            return self.auth.get('user_id') is not None
+        return bool(self.auth.get('username'))
+
+    def _get_auth_async_lock(self):
+        import asyncio
+        loop = asyncio.get_running_loop()
+        if self._auth_async_lock is None or self._auth_async_lock_loop is not loop:
+            self._auth_async_lock = asyncio.Lock()
+            self._auth_async_lock_loop = loop
+        return self._auth_async_lock
+
+    def login_with_option_auth(self,
+                               impl=None,
+                               force: bool = False,
+                               ):
+        """
+        使用 option.auth 的账号密码执行同步登录，并将登录态（cookies、user_id）写回 option.auth。
+        默认幂等（force=False）：若当前目标端所需的登录态已就绪，则直接跳过网络请求。
+        """
+        u = self.auth.get('username')
+        p = self.auth.get('password')
+        ExceptionTool.require_true(bool(u), '用户名不能为空')
+        ExceptionTool.require_true(bool(p), '密码不能为空')
+
+        target_impl = impl or self.client.impl
+        if isinstance(target_impl, type):
+            target_impl = target_impl.client_key
+        is_api = self.client_key_is_given_type(target_impl, JmApiClient)
+
+        if not force and self._is_auth_logged_in(is_api):
+            return None
+
+        with self._auth_sync_lock:
+            if not force and self._is_auth_logged_in(is_api):
+                return None
+            client = self.new_jm_client(impl=impl)
+            resp = client.login(u, p)
+            # noinspection protected-member
+            self.update_auth(
+                cookies=dict(client['cookies']),
+                user_id=client._user_id,
+            )
+            return resp
+
+    async def login_with_option_auth_async(self,
+                                           impl=None,
+                                           force: bool = False,
+                                           ):
+        """
+        使用 option.auth 的账号密码执行异步登录，并将登录态（cookies、user_id）写回 option.auth。
+        默认幂等（force=False）：若当前目标端所需的登录态已就绪，则直接跳过网络请求。
+        """
+        u = self.auth.get('username')
+        p = self.auth.get('password')
+        ExceptionTool.require_true(bool(u), '用户名不能为空')
+        ExceptionTool.require_true(bool(p), '密码不能为空')
+
+        client = self.new_jm_async_client(impl=impl)
+        is_api = client.is_api()
+
+        if not force and self._is_auth_logged_in(is_api):
+            return None
+
+        async with self._get_auth_async_lock():
+            if not force and self._is_auth_logged_in(is_api):
+                return None
+            async with client:
+                resp = await client.login(u, p)
+                # noinspection unresolved-references
+                self.update_auth(
+                    cookies=dict(client['cookies']),
+                    user_id=client._user_id,
+                )
+                return resp
+
+    def _sync_cached_client_auth(self):
+        cached_client = self.__dict__.get('__cache_build_jm_client__')
+        if cached_client is not None:
+            merged_cookies = self.resolve_auth_cookies()
+            if merged_cookies:
+                cached_client['cookies'] = merged_cookies
+            cached_client._username = self.auth.get('username')
+            cached_client._user_id = self.auth.get('user_id')
+
+    def update_auth(self,
+                    cookies: Optional[dict] = None,
+                    user_id: Optional[str] = None,
+                    ):
+        if cookies is not None:
+            if not self.auth.get('cookies'):
+                self.auth.cookies = dict(cookies)
+            else:
+                self.auth.cookies.src_dict.update(cookies)
+        if user_id is not None:
+            self.auth.user_id = str(user_id)
+        self._sync_cached_client_auth()
+
+    def update_cookies(self, cookies: dict):
+        self.update_auth(cookies=cookies)
+
+    # noinspection PyMethodMayBeStatic,PyTypeChecker
     def decide_client_domain(self, client_key: str) -> List[str]:
         def is_client_type(ctype) -> bool:
             return self.client_key_is_given_type(client_key, ctype)
@@ -475,8 +717,8 @@ class JmOption:
         if is_client_type(JmHtmlClient):
             # 网页端
             domain_list = JmModuleConfig.DOMAIN_HTML_LIST
-            if domain_list is not None:
-                return domain_list
+            if domain_list:
+                return list(domain_list)
             return [JmModuleConfig.get_html_domain()]
 
         ExceptionTool.raises(f'没有配置域名，且是无法识别的client类型: {client_key}')
@@ -511,23 +753,109 @@ class JmOption:
 
     def download_album(self,
                        album_id,
-                       downloader=None,
-                       callback=None,
+                       *args,
+                       **kwargs,
                        ):
         from .api import download_album
-        download_album(album_id, self, downloader, callback)
+        return download_album(album_id, self, *args, **kwargs)
 
     def download_photo(self,
                        photo_id,
-                       downloader=None,
-                       callback=None
+                       *args,
+                       **kwargs,
                        ):
         from .api import download_photo
-        download_photo(photo_id, self, downloader, callback)
+        return download_photo(photo_id, self, *args, **kwargs)
+
+    def new_jm_async_client(self,
+                            cache=None,
+                            domain_list: Optional[Union[str, Sequence[str]]] = None,
+                            impl=None,
+                            **kwargs,
+                            ) -> AsyncJmcomicClient:
+        """
+        通过 Option 配置创建异步客户端。
+        从 REGISTRY_ASYNC_CLIENT 注册表查找实现类（配置项: client.async_impl），
+        其内部实现逻辑与同步版本的 new_jm_client 保持一致。
+
+        缓存：与同步版本 new_jm_client 相同，依据 client.cache 配置决定是否启用缓存
+        （默认 None 即为不缓存），并通过 CacheRegistry.enable_client_cache_on_condition 下发配置。
+        """
+        if 'domain_retry_strategy' in kwargs:
+            raise TypeError('Async client does not support domain_retry_strategy')
+
+        if impl is not None:
+            async_impl = impl.client_key if isinstance(impl, type) else impl
+            if async_impl in ('html', 'api'):
+                async_impl = f'async_{async_impl}'
+        elif self.client.async_impl:
+            async_impl = self.client.async_impl
+            if isinstance(async_impl, type):
+                async_impl = async_impl.client_key
+            elif async_impl in ('html', 'api'):
+                async_impl = f'async_{async_impl}'
+        else:
+            sync_impl = self.client.impl
+            if isinstance(sync_impl, type):
+                sync_impl = sync_impl.client_key
+            async_impl = f'async_{sync_impl}' if sync_impl in ('html', 'api') else 'async_api'
+
+        clazz = JmModuleConfig.async_client_impl_class(async_impl)
+        from .jm_async_client import AbstractAsyncJmClient
+        if clazz == AbstractAsyncJmClient or not issubclass(clazz, AsyncJmcomicClient):
+            raise NotImplementedError(clazz)
+        if domain_list is None:
+            client = clazz(self, **kwargs)
+        else:
+            client = clazz(self, domain_list=domain_list, **kwargs)
+
+        # 启用缓存（与同步版本保持一致）：默认不缓存，由 client.cache 配置决定
+        cache = cache if cache is not None else self.client.cache
+        CacheRegistry.enable_client_cache_on_condition(self, client, cache)
+        return client
+
+    async def download_album_async(self, album_id, *args, **kwargs):
+        from .api import download_album_async
+        return await download_album_async(album_id, self, *args, **kwargs)
+
+    async def download_photo_async(self, photo_id, *args, **kwargs):
+        from .api import download_photo_async
+        return await download_photo_async(photo_id, self, *args, **kwargs)
 
     # 下面的方法为调用插件提供支持
 
-    def call_all_plugin(self, group: str, safe=True, **extra):
+    def check_plugins_dependencies(self) -> None:
+        """
+        根据 plugins.dependencies_strategy 策略校验或安装已启用插件所需的依赖库。
+
+        支持的策略值：
+        - failed-fast（默认）：缺失依赖时快速失败，抛出带清晰解决方案指引的异常。
+        - auto-install：缺失依赖时以插件为维度自动调用 pip 安装缺失包。
+        - ignore-only-log：缺失依赖时仅打印 warning 日志，不阻断运行。
+
+        具体检查、安装与错误处理逻辑收口于 JmOptionPlugin.check_plugin_dependency。
+        """
+        # 保证 jm_plugin.py 被加载
+        from .jm_plugin import JmOptionPlugin
+
+        strategy = self.plugins.dependencies_strategy
+        plugin_registry = JmModuleConfig.REGISTRY_PLUGIN
+
+        for group, plist in self.plugins.src_dict.items():
+            if not isinstance(plist, list):
+                continue
+
+            for pinfo in plist:
+                if not isinstance(pinfo, dict):
+                    continue
+
+                pclass: Optional[Type[JmOptionPlugin]] = plugin_registry.get(pinfo.get('plugin'), None)
+                if pclass is None:
+                    continue
+
+                pclass.check_plugin_dependency(pinfo.get('kwargs') or {}, strategy=strategy)
+
+    def call_all_plugin(self, group: str, safe=None, **extra):
         plugin_list: List[dict] = self.plugins.get(group, [])
         if plugin_list is None or len(plugin_list) == 0:
             return
@@ -545,14 +873,14 @@ class JmOption:
             try:
                 self.invoke_plugin(pclass, kwargs, extra, pinfo)
             except BaseException as e:
-                if safe is True:
-                    traceback_print_exec()
+                if safe is True or pinfo.get('safe', True):
+                    jm_log('plugin.exception', e)
                 else:
                     raise e
 
     def invoke_plugin(self, pclass, kwargs: Optional[Dict], extra: dict, pinfo: dict):
         # 检查插件的参数类型
-        kwargs = self.fix_kwargs(kwargs)
+        kwargs: dict = self.fix_kwargs(kwargs)
         # 把插件的配置数据kwargs和附加数据extra合并，extra会覆盖kwargs
         if len(extra) != 0:
             kwargs.update(extra)
@@ -568,7 +896,7 @@ class JmOption:
             plugin: JmOptionPlugin = pclass.build(self)
 
             # 设置日志开关
-            if pinfo.get('log', True) is not True:
+            if not pinfo.get('log', True):
                 plugin.log_enable = False
 
             jm_log('plugin.invoke', f'调用插件: [{pclass.plugin_key}]')
@@ -586,6 +914,64 @@ class JmOption:
 
         except BaseException as e:
             # 为插件兜底，捕获其他所有异常
+            self.handle_plugin_unexpected_error(e, pinfo, kwargs, plugin, pclass)
+
+    async def call_all_plugin_async(self, group: str, safe=None, **extra):
+        plugin_list: List[dict] = self.plugins.get(group, [])
+        if plugin_list is None or len(plugin_list) == 0:
+            return
+
+        import asyncio
+        from .jm_plugin import JmOptionPlugin
+
+        plugin_registry = JmModuleConfig.REGISTRY_PLUGIN
+        for pinfo in plugin_list:
+            key, kwargs = pinfo['plugin'], pinfo.get('kwargs', None)
+            pclass: Optional[Type[JmOptionPlugin]] = plugin_registry.get(key, None)
+
+            ExceptionTool.require_true(pclass is not None, f'[{group}] 未注册的plugin: {key}')
+
+            try:
+                await self.invoke_plugin_async(pclass, kwargs, extra, pinfo)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:
+                if safe is True or pinfo.get('safe', True):
+                    jm_log('plugin.exception', e)
+                else:
+                    raise e
+
+    async def invoke_plugin_async(self, pclass, kwargs: Optional[Dict], extra: dict, pinfo: dict):
+        kwargs: dict = self.fix_kwargs(kwargs)
+        if len(extra) != 0:
+            kwargs.update(extra)
+
+        import asyncio
+        from .jm_plugin import JmOptionPlugin, PluginValidationException
+
+        pclass: Type[JmOptionPlugin]
+        plugin: Optional[JmOptionPlugin] = None
+
+        try:
+            plugin: JmOptionPlugin = pclass.build(self)
+
+            if not pinfo.get('log', True):
+                plugin.log_enable = False
+
+            jm_log('plugin.invoke', f'调用插件: [{pclass.plugin_key}]')
+
+            await plugin.async_invoke(**kwargs)
+
+        except PluginValidationException as e:
+            self.handle_plugin_valid_exception(e, pinfo, kwargs, plugin, pclass)
+
+        except JmcomicException as e:
+            self.handle_plugin_jmcomic_exception(e, pinfo, kwargs, plugin, pclass)
+
+        except asyncio.CancelledError:
+            raise
+
+        except BaseException as e:
             self.handle_plugin_unexpected_error(e, pinfo, kwargs, plugin, pclass)
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
@@ -615,13 +1001,13 @@ class JmOption:
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def handle_plugin_unexpected_error(self, e, pinfo: dict, kwargs: dict, _plugin, pclass):
         msg = str(e)
-        jm_log('plugin.error', f'插件 [{pclass.plugin_key}]，运行遇到未捕获异常，异常信息: [{msg}]')
+        jm_log('plugin.error', f'插件 [{pclass.plugin_key}]，运行遇到未捕获异常，异常信息: [{msg}]', e)
         raise e
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def handle_plugin_jmcomic_exception(self, e, pinfo: dict, kwargs: dict, _plugin, pclass):
         msg = str(e)
-        jm_log('plugin.exception', f'插件 [{pclass.plugin_key}] 调用失败，异常信息: [{msg}]')
+        jm_log('plugin.exception', f'插件 [{pclass.plugin_key}] 调用失败，异常信息: [{msg}]', e)
         raise e
 
     # noinspection PyMethodMayBeStatic

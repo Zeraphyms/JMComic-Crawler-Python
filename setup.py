@@ -25,31 +25,31 @@ setup(
     author_email='93357912+hect0x7@users.noreply.github.com',
     packages=find_packages("src"),
     package_dir={"": "src"},
-    python_requires=">=3.7",
+    python_requires=">=3.9",
     install_requires=[
         'curl_cffi',
-        'commonX',
         'PyYAML',
         'Pillow',
         'pycryptodome',
     ],
-    keywords=['python', 'jmcomic', '18comic', '禁漫天堂', 'NSFW'],
+    keywords=['python', 'jmcomic', '18comic', '禁漫天堂', 'crawler'],
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Operating System :: MacOS",
         "Operating System :: POSIX :: Linux",
         "Operating System :: Microsoft :: Windows",
     ],
     entry_points={
         'console_scripts': [
-            'jmcomic = jmcomic.cl:main'
+            'jmcomic = jmcomic.cli:main',
+            'jmv = jmcomic.cli:view_main',
         ]
     }
 )

@@ -1,7 +1,48 @@
+import asyncio
+import inspect
+import traceback
+from typing import Iterable
+from unittest.mock import AsyncMock, patch
+
 from test_jmcomic import *
 
 
 class Test_Api(JmTestConfigurable):
+
+    def test_callback_is_not_public_download_api(self):
+        for download_api in (
+                download_album,
+                download_photo,
+                download_album_async,
+                download_photo_async,
+        ):
+            parameters = inspect.signature(download_api).parameters
+            self.assertNotIn('callback', parameters)
+            self.assertNotIn('runtime', parameters)
+            self.assertNotIn('workers', parameters)
+            self.assertNotIn('executor', parameters)
+            self.assertEqual(
+                parameters['check_exception'].kind,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+
+    def test_multi_id_shortcuts_do_not_forward_check_exception(self):
+        for download_api in (download_album, download_photo):
+            expected = BatchResult()
+            with patch('jmcomic.api.download_batch', return_value=expected) as batch:
+                actual = download_api(['123', '456'], check_exception=False)
+
+            self.assertIs(actual, expected)
+            self.assertNotIn('check_exception', batch.call_args.kwargs)
+
+        for download_api in (download_album_async, download_photo_async):
+            expected = BatchResult()
+            batch = AsyncMock(return_value=expected)
+            with patch('jmcomic.api.download_batch_async', new=batch):
+                actual = asyncio.run(download_api(['123', '456'], check_exception=False))
+
+            self.assertIs(actual, expected)
+            self.assertNotIn('check_exception', batch.call_args.kwargs)
 
     def test_download_photo_by_id(self):
         """
@@ -47,7 +88,6 @@ class Test_Api(JmTestConfigurable):
         func_list = {
             self.client.get_html_domain,
             self.client.get_html_domain_all,
-            self.client.get_html_domain_all_via_github,
             # JmModuleConfig.get_jmcomic_url,
             # JmModuleConfig.get_jmcomic_domain_all,
         }
@@ -59,7 +99,7 @@ class Test_Api(JmTestConfigurable):
                 print(func())
             except BaseException as e:
                 exception_list.append(e)
-                traceback_print_exec()
+                traceback.print_exc()
 
         multi_thread_launcher(
             iter_objs=func_list,
@@ -69,10 +109,38 @@ class Test_Api(JmTestConfigurable):
         if len(exception_list) == 0:
             return
 
-        if self.client.is_given_type(JmApiClient):
+        if self.client.is_api():
             return
 
         for e in exception_list:
             print(e)
 
         raise AssertionError(exception_list)
+
+    def test_partial_exception(self):
+        class TestDownloader(JmDownloader):
+            def do_filter(self, detail: DetailEntity):
+                if detail.is_photo():
+                    return detail[0:2]
+                if detail.is_album():
+                    return detail[0:2]
+                return super().do_filter(detail)
+
+            @catch_exception
+            def download_by_image_detail(self, image: JmImageDetail):
+                raise Exception('test_partial_exception')
+
+            @catch_exception
+            def download_by_photo_detail(self, photo: JmPhotoDetail):
+                if photo.index != 2:
+                    raise Exception('test_partial_exception')
+                return super().download_by_photo_detail(photo)
+
+        self.assertRaises(
+            PartialDownloadFailedException,
+            lambda: download_album(182150, downloader=TestDownloader, check_exception=True)
+        )
+        self.assertRaises(
+            PartialDownloadFailedException,
+            lambda: download_photo(182151, downloader=TestDownloader, check_exception=True)
+        )
